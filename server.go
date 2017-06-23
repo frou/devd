@@ -1,6 +1,7 @@
 package devd
 
 import (
+	"bufio"
 	"crypto/tls"
 	"fmt"
 	"html/template"
@@ -32,6 +33,13 @@ const (
 	Version  = "0.6"
 	portLow  = 8000
 	portHigh = 10000
+)
+
+type SignalsMode byte
+
+const (
+	SignalsNormal SignalsMode = iota
+	SignalsReadPipe
 )
 
 func pickPort(addr string, low int, high int, tls bool) (net.Listener, error) {
@@ -146,9 +154,10 @@ type Devd struct {
 	// Livereload and watch static routes
 	LivereloadRoutes bool
 	// Livereload, but don't watch static routes
-	Livereload bool
-	WatchPaths []string
-	Excludes   []string
+	Livereload  bool
+	WatchPaths  []string
+	Excludes    []string
+	SignalsMode SignalsMode
 
 	// Logging
 	IgnoreLogs []*regexp.Regexp
@@ -355,15 +364,35 @@ func (dd *Devd) Serve(address string, port int, certFile string, logger termlog.
 	callback(url)
 
 	if dd.HasLivereload() {
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, syscall.SIGHUP)
-		go func() {
-			for {
-				<-c
-				logger.Say("Received signal - reloading")
-				dd.lrserver.Reload([]string{"*"})
-			}
-		}()
+		switch dd.SignalsMode {
+		case SignalsNormal:
+			c := make(chan os.Signal, 1)
+			signal.Notify(c, syscall.SIGHUP)
+			go func() {
+				for {
+					<-c
+					logger.Say("Received signal - reloading")
+					dd.lrserver.Reload([]string{"*"})
+				}
+			}()
+		case SignalsReadPipe:
+			lines := bufio.NewScanner(os.Stdin)
+			go func() {
+				for lines.Scan() {
+					switch s := lines.Text(); s {
+					case "hangup":
+						logger.Say("Read signal on stdin - reloading")
+						dd.lrserver.Reload([]string{"*"})
+					default:
+						logger.Say("Read unknown signal on stdin: %s", s)
+					}
+				}
+				if err := lines.Err(); err != nil {
+					logger.Shout("Error while reading stdin: %v", err)
+					return
+				}
+			}()
+		}
 	}
 
 	err = server.Serve(hl)

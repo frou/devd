@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"runtime"
 
 	"github.com/cortesi/devd"
 	"github.com/cortesi/termlog"
@@ -62,6 +63,14 @@ func main() {
 		Short('l').
 		Default("false").
 		Bool()
+
+	readPipe := new(bool)
+	if runtime.GOOS == "windows" {
+		readPipe = kingpin.Flag("readpipe", "Read signal strings from stdin (Windows does not support normal signals)").
+			Short('r').
+			Default("true").
+			Bool()
+	}
 
 	moddMode := kingpin.Flag("modd", "Modd is our parent - synonym for -LCt").
 		Short('m').
@@ -182,6 +191,11 @@ func main() {
 		hdrs.Set("Access-Control-Allow-Origin", "*")
 	}
 
+	signalsMode := devd.SignalsNormal
+	if *readPipe {
+		signalsMode = devd.SignalsReadPipe
+	}
+
 	dd := devd.Devd{
 		// Shaping
 		Latency:  *latency,
@@ -195,6 +209,7 @@ func main() {
 		Livereload:       *livereloadNaked,
 		WatchPaths:       *watch,
 		Excludes:         *excludes,
+		SignalsMode:      signalsMode,
 
 		Credentials: creds,
 	}
