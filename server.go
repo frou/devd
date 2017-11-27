@@ -30,7 +30,7 @@ import (
 
 const (
 	// Version is the current version of devd
-	Version  = "0.6"
+	Version  = "0.7"
 	portLow  = 8000
 	portHigh = 10000
 )
@@ -219,10 +219,10 @@ func (dd *Devd) HasLivereload() bool {
 }
 
 // AddRoutes adds route specifications to the server
-func (dd *Devd) AddRoutes(specs []string) error {
+func (dd *Devd) AddRoutes(specs []string, notfound []string) error {
 	dd.Routes = make(RouteCollection)
 	for _, s := range specs {
-		err := dd.Routes.Add(s)
+		err := dd.Routes.Add(s, notfound)
 		if err != nil {
 			return fmt.Errorf("Invalid route specification: %s", err)
 		}
@@ -273,9 +273,8 @@ func (dd *Devd) Router(logger termlog.TermLog, templates *template.Template) (ht
 		}
 		handler := dd.WrapHandler(
 			logger,
-			route.Endpoint.Handler(templates, ci),
+			route.Endpoint.Handler(route.Path, templates, ci),
 		)
-		handler = http.StripPrefix(route.Path, handler)
 		mux.Handle(match, handler)
 	}
 	if dd.HasLivereload() {

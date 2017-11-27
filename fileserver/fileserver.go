@@ -5,6 +5,7 @@ package fileserver
 
 import (
 	"errors"
+	"fmt"
 	"html/template"
 	"io"
 	"mime"
@@ -20,6 +21,7 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cortesi/devd/inject"
+	"github.com/cortesi/devd/routespec"
 	"github.com/cortesi/termlog"
 )
 
@@ -48,6 +50,12 @@ func (p fileSlice) Less(i, j int) bool {
 	if b.IsDir() && !a.IsDir() {
 		return false
 	}
+	if strings.HasPrefix(a.Name(), ".") && !strings.HasPrefix(b.Name(), ".") {
+		return false
+	}
+	if strings.HasPrefix(b.Name(), ".") && !strings.HasPrefix(a.Name(), ".") {
+		return true
+	}
 	return a.Name() < b.Name()
 }
 
@@ -56,24 +64,23 @@ func (p fileSlice) Swap(i, j int) {
 }
 
 type dirData struct {
-	Name  string
-	Files fileSlice
+	Version string
+	Name    string
+	Files   fileSlice
 }
 
-func dirList(ci inject.CopyInject, logger termlog.Logger, w http.ResponseWriter, name string, f http.File, templates *template.Template) {
-	w.Header().Set("Cache-Control", "no-store, must-revalidate")
-	files, err := f.Readdir(0)
-	if err != nil {
-		logger.Shout("Error reading directory for listing: %s", err)
-		return
+type fourohfourData struct {
+	Version string
+}
+
+func stripPrefix(prefix string, path string) string {
+	if prefix == "" {
+		return path
 	}
-	sortedFiles := fileSlice(files)
-	sort.Sort(sortedFiles)
-	data := dirData{Name: name, Files: sortedFiles}
-	err = ci.ServeTemplate(http.StatusOK, w, templates.Lookup("dirlist.html"), data)
-	if err != nil {
-		logger.Shout("Failed to generate dir listing: %s", err)
+	if p := strings.TrimPrefix(path, prefix); len(p) < len(path) {
+		return p
 	}
+	return path
 }
 
 // errSeeker is returned by ServeContent's sizeFunc when the content
@@ -224,9 +231,12 @@ func localRedirect(w http.ResponseWriter, r *http.Request, newPath string) {
 //
 //     http.Handle("/", &fileserver.FileServer{Root: http.Dir("/tmp")})
 type FileServer struct {
-	Root      http.FileSystem
-	Inject    inject.CopyInject
-	Templates *template.Template
+	Version        string
+	Root           http.FileSystem
+	Inject         inject.CopyInject
+	Templates      *template.Template
+	NotFoundRoutes []routespec.RouteSpec
+	Prefix         string
 }
 
 func (fserver *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -240,20 +250,192 @@ func (fserver *FileServer) ServeHTTPContext(
 	logger := termlog.FromContext(ctx)
 	logger.SayAs("debug", "debug fileserver: serving with FileServer...")
 
-	upath := r.URL.Path
+	upath := stripPrefix(fserver.Prefix, r.URL.Path)
 	if !strings.HasPrefix(upath, "/") {
 		upath = "/" + upath
-		r.URL.Path = upath
 	}
 	fserver.serveFile(logger, w, r, path.Clean(upath), true)
 }
 
-func notFound(ci inject.CopyInject, templates *template.Template, w http.ResponseWriter) error {
-	err := ci.ServeTemplate(http.StatusNotFound, w, templates.Lookup("404.html"), nil)
+// Given a path and a "not found" over-ride specification, return an array of
+// over-ride paths that should be considered for serving, in priority order. We
+// assume that path is a sub-path above a certain root, and we never return
+// paths that would fall outside this.
+//
+// We also sanity check file extensions to make sure that the expected file
+// type matches what we serve. This prevents an over-ride for *.html files from
+// serving up data when, say, a missing .png is requested.
+func notFoundSearchPaths(pth string, spec string) []string {
+	var ret []string
+	if strings.HasPrefix(spec, "/") {
+		ret = []string{path.Clean(spec)}
+	} else {
+		for {
+			pth = path.Dir(pth)
+			if pth == "/" {
+				ret = append(ret, path.Join(pth, spec))
+				break
+			}
+			ret = append(ret, path.Join(pth, spec))
+		}
+	}
+	return ret
+}
+
+// Get the media type for an extension, via a MIME lookup, defaulting to
+// "text/html".
+func _getType(ext string) string {
+	typ := mime.TypeByExtension(ext)
+	if typ == "" {
+		return "text/html"
+	}
+	smime, _, err := mime.ParseMediaType(typ)
+	if err != nil {
+		return "text/html"
+	}
+	return smime
+}
+
+// Checks whether the incoming request has the same expected type as an
+// over-ride specification.
+func matchTypes(spec string, req string) bool {
+	smime := _getType(path.Ext(spec))
+	rmime := _getType(path.Ext(req))
+	if smime == rmime {
+		return true
+	}
+	return false
+}
+
+func (fserver *FileServer) serve404(w http.ResponseWriter) error {
+	d := fourohfourData{
+		Version: fserver.Version,
+	}
+	err := fserver.Inject.ServeTemplate(
+		http.StatusNotFound,
+		w,
+		fserver.Templates.Lookup("404.html"),
+		&d,
+	)
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+func (fserver *FileServer) dirList(logger termlog.Logger, w http.ResponseWriter, name string, f http.File) {
+	w.Header().Set("Cache-Control", "no-store, must-revalidate")
+	files, err := f.Readdir(0)
+	if err != nil {
+		logger.Shout("Error reading directory for listing: %s", err)
+		return
+	}
+	sortedFiles := fileSlice(files)
+	sort.Sort(sortedFiles)
+	data := dirData{
+		Version: fserver.Version,
+		Name:    name,
+		Files:   sortedFiles,
+	}
+	err = fserver.Inject.ServeTemplate(
+		http.StatusOK,
+		w,
+		fserver.Templates.Lookup("dirlist.html"),
+		data,
+	)
+	if err != nil {
+		logger.Shout("Failed to generate dir listing: %s", err)
+	}
+}
+
+func (fserver *FileServer) notFound(
+	logger termlog.Logger,
+	w http.ResponseWriter,
+	r *http.Request,
+	name string,
+	dir *http.File,
+) (err error) {
+	sm := http.NewServeMux()
+	seen := make(map[string]bool)
+	for _, nfr := range fserver.NotFoundRoutes {
+		seen[nfr.MuxMatch()] = true
+		sm.HandleFunc(
+			nfr.MuxMatch(),
+			func(nfr routespec.RouteSpec) func(w http.ResponseWriter, r *http.Request) {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if matchTypes(nfr.Value, r.URL.Path) {
+						for _, pth := range notFoundSearchPaths(name, nfr.Value) {
+							next, err := fserver.serveNotFoundFile(w, r, pth)
+							if err != nil {
+								logger.Shout("Unable to serve not-found override: %s", err)
+							}
+							if !next {
+								return
+							}
+						}
+					}
+					err = fserver.serve404(w)
+					if err != nil {
+						logger.Shout("Internal error: %s", err)
+					}
+				}
+			}(nfr),
+		)
+	}
+	if _, exists := seen["/"]; !exists {
+		sm.HandleFunc(
+			"/",
+			func(response http.ResponseWriter, request *http.Request) {
+				if dir != nil {
+					d, err := (*dir).Stat()
+					if err != nil {
+						logger.Shout("Internal error: %s", err)
+						return
+					}
+					if checkLastModified(response, request, d.ModTime()) {
+						return
+					}
+					fserver.dirList(logger, response, name, *dir)
+					return
+				}
+				err = fserver.serve404(w)
+				if err != nil {
+					logger.Shout("Internal error: %s", err)
+				}
+			},
+		)
+	}
+	handle, _ := sm.Handler(r)
+	handle.ServeHTTP(w, r)
+	return err
+}
+
+// If the next return value is true, the caller should proceed to the next
+// over-ride path if there is one. If the err return value is non-nil, serving
+// should stop.
+func (fserver *FileServer) serveNotFoundFile(
+	w http.ResponseWriter,
+	r *http.Request,
+	name string,
+) (next bool, err error) {
+	f, err := fserver.Root.Open(name)
+	if err != nil {
+		return true, nil
+	}
+	defer func() { _ = f.Close() }()
+
+	d, err := f.Stat()
+	if err != nil || d.IsDir() {
+		return true, nil
+	}
+
+	// serverContent will check modification time
+	sizeFunc := func() (int64, error) { return d.Size(), nil }
+	err = serveContent(fserver.Inject, w, r, d.Name(), d.ModTime(), sizeFunc, f)
+	if err != nil {
+		return false, fmt.Errorf("Error serving file: %s", err)
+	}
+	return false, nil
 }
 
 // name is '/'-separated, not filepath.Separator.
@@ -280,17 +462,17 @@ func (fserver *FileServer) serveFile(
 	f, err := fserver.Root.Open(name)
 	if err != nil {
 		logger.WarnAs("debug", "debug fileserver: %s", err)
-		if err := notFound(fserver.Inject, fserver.Templates, w); err != nil {
+		if err := fserver.notFound(logger, w, r, name, nil); err != nil {
 			logger.Shout("Internal error: %s", err)
 		}
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	d, err1 := f.Stat()
 	if err1 != nil {
 		logger.WarnAs("debug", "debug fileserver: %s", err)
-		if err := notFound(fserver.Inject, fserver.Templates, w); err != nil {
+		if err := fserver.notFound(logger, w, r, name, nil); err != nil {
 			logger.Shout("Internal error: %s", err)
 		}
 		return
@@ -298,18 +480,18 @@ func (fserver *FileServer) serveFile(
 
 	if redirect {
 		// redirect to canonical path: / at end of directory url
-		// r.URL.Path always begins with /
 		url := r.URL.Path
+		if !strings.HasPrefix(url, "/") {
+			url = "/" + url
+		}
 		if d.IsDir() {
 			if url[len(url)-1] != '/' {
 				localRedirect(w, r, path.Base(url)+"/")
 				return
 			}
-		} else {
-			if url[len(url)-1] == '/' {
-				localRedirect(w, r, "../"+path.Base(url))
-				return
-			}
+		} else if url[len(url)-1] == '/' {
+			localRedirect(w, r, "../"+path.Base(url))
+			return
 		}
 	}
 
@@ -318,7 +500,7 @@ func (fserver *FileServer) serveFile(
 		index := name + indexPage
 		ff, err := fserver.Root.Open(index)
 		if err == nil {
-			defer ff.Close()
+			defer func() { _ = ff.Close() }()
 			dd, err := ff.Stat()
 			if err == nil {
 				name = index
@@ -330,10 +512,9 @@ func (fserver *FileServer) serveFile(
 
 	// Still a directory? (we didn't find an index.html file)
 	if d.IsDir() {
-		if checkLastModified(w, r, d.ModTime()) {
-			return
+		if err := fserver.notFound(logger, w, r, name, &f); err != nil {
+			logger.Shout("Internal error: %s", err)
 		}
-		dirList(fserver.Inject, logger, w, name, f, fserver.Templates)
 		return
 	}
 

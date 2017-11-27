@@ -41,6 +41,11 @@ func main() {
 		Default("0").
 		Uint()
 
+	notfound := kingpin.Flag("notfound", "Default when a static file is not found").
+		PlaceHolder("PATH").
+		Short('f').
+		Strings()
+
 	logHeaders := kingpin.Flag("logheaders", "Log headers").
 		Short('H').
 		Default("false").
@@ -107,7 +112,7 @@ func main() {
 		Default("false").
 		Bool()
 
-	tls := kingpin.Flag("tls", "Serve TLS with auto-generated self-signed certificate (~/.devd.crt)").
+	tls := kingpin.Flag("tls", "Serve TLS with auto-generated self-signed certificate (~/.devd.cert)").
 		Short('s').
 		Default("false").
 		Bool()
@@ -214,7 +219,7 @@ func main() {
 		Credentials: creds,
 	}
 
-	if err := dd.AddRoutes(*routes); err != nil {
+	if err := dd.AddRoutes(*routes, *notfound); err != nil {
 		kingpin.Fatalf("%s", err)
 	}
 
